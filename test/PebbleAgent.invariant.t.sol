@@ -65,8 +65,101 @@ contract PebbleHandler is Test {
         );
         token.transferFrom(owner, to, amount);
     }
+
+    /// @dev Explicitly reaches empty accounts instead of depending on a random amount hitting the balance.
+    function moveEntireBalance(uint256 fromSeed, uint256 toSeed) external {
+        address from = actors[fromSeed % actors.length];
+        address to = actors[toSeed % actors.length];
+        uint256 amount = modelBalance[from];
+        vm.prank(from);
+        assertTrue(token.transfer(to, amount));
+        modelBalance[from] -= amount;
+        modelBalance[to] += amount;
+    }
+
+    function revoke(uint256 ownerSeed, uint256 spenderSeed) external {
+        address owner = actors[ownerSeed % actors.length];
+        address spender = actors[spenderSeed % actors.length];
+        vm.prank(owner);
+        assertTrue(token.approve(spender, 0));
+        modelAllowance[owner][spender] = 0;
+
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, spender, 0, 1));
+        vm.prank(spender);
+        token.transferFrom(owner, spender, 1);
+    }
+
+    function attemptOverdraw(uint256 fromSeed, uint256 toSeed, uint256 amountSeed) external {
+        address from = actors[fromSeed % actors.length];
+        address to = actors[toSeed % actors.length];
+        uint256 held = modelBalance[from];
+        uint256 amount = bound(amountSeed, held + 1, type(uint256).max);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, from, held, amount));
+        vm.prank(from);
+        token.transfer(to, amount);
+        // Failed calls leave the ghost state untouched; the invariants check atomic rollback.
+    }
+
+    function attemptApprovedOverdraw(
+        uint256 ownerSeed,
+        uint256 spenderSeed,
+        uint256 toSeed,
+        uint256 amountSeed,
+        bool unlimited
+    ) external {
+        address owner = actors[ownerSeed % actors.length];
+        address spender = actors[spenderSeed % actors.length];
+        address to = actors[toSeed % actors.length];
+        uint256 held = modelBalance[owner];
+        // Keep the finite branch below the infinite-approval sentinel.
+        uint256 amount = bound(amountSeed, held + 1, type(uint256).max - 1);
+        uint256 allowed = unlimited ? type(uint256).max : amount;
+        vm.prank(owner);
+        assertTrue(token.approve(spender, allowed));
+        modelAllowance[owner][spender] = allowed;
+
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, owner, held, amount));
+        vm.prank(spender);
+        token.transferFrom(owner, to, amount);
+    }
+
+    function attemptOverspend(uint256 ownerSeed, uint256 spenderSeed, uint256 allowanceSeed) external {
+        address owner = actors[ownerSeed % actors.length];
+        address spender = actors[spenderSeed % actors.length];
+        uint256 allowed = bound(allowanceSeed, 0, type(uint256).max - 1);
+        vm.prank(owner);
+        assertTrue(token.approve(spender, allowed));
+        modelAllowance[owner][spender] = allowed;
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, spender, allowed, allowed + 1)
+        );
+        vm.prank(spender);
+        token.transferFrom(owner, spender, allowed + 1);
+    }
+
+    function attemptZeroRecipient(uint256 ownerSeed, uint256 spenderSeed, uint256 amountSeed, bool delegated) external {
+        address owner = actors[ownerSeed % actors.length];
+        address spender = actors[spenderSeed % actors.length];
+        uint256 limit = modelBalance[owner];
+        if (delegated && modelAllowance[owner][spender] < limit) limit = modelAllowance[owner][spender];
+        uint256 amount = bound(amountSeed, 0, limit);
+
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InvalidReceiver.selector, address(0)));
+        if (delegated) {
+            vm.prank(spender);
+            token.transferFrom(owner, address(0), amount);
+        } else {
+            vm.prank(owner);
+            token.transfer(address(0), amount);
+        }
+    }
 }
 
+/// @dev Counts live here so the test campaign does not require configuration changes.
+/// forge-config: default.invariant.runs = 256
+/// forge-config: default.invariant.depth = 128
+/// forge-config: default.invariant.fail-on-revert = true
 contract PebbleAgentInvariantTest is Test {
     uint256 private constant SUPPLY = 1_000_000_000 * 10 ** 18;
     PebbleHandler private handler;
@@ -75,11 +168,17 @@ contract PebbleAgentInvariantTest is Test {
     function setUp() public {
         handler = new PebbleHandler();
         token = handler.token();
-        bytes4[] memory selectors = new bytes4[](4);
+        bytes4[] memory selectors = new bytes4[](10);
         selectors[0] = PebbleHandler.move.selector;
         selectors[1] = PebbleHandler.approve.selector;
         selectors[2] = PebbleHandler.moveApproved.selector;
         selectors[3] = PebbleHandler.attemptUnauthorizedTransfer.selector;
+        selectors[4] = PebbleHandler.moveEntireBalance.selector;
+        selectors[5] = PebbleHandler.revoke.selector;
+        selectors[6] = PebbleHandler.attemptOverdraw.selector;
+        selectors[7] = PebbleHandler.attemptApprovedOverdraw.selector;
+        selectors[8] = PebbleHandler.attemptOverspend.selector;
+        selectors[9] = PebbleHandler.attemptZeroRecipient.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
     }
@@ -106,5 +205,19 @@ contract PebbleAgentInvariantTest is Test {
                 assertEq(token.allowance(owner, spender), handler.modelAllowance(owner, spender));
             }
         }
+    }
+
+    /// @dev Every holder must remain able to move its entire balance after any random history.
+    function afterInvariant() public {
+        for (uint256 i = 1; i < 4; ++i) {
+            handler.moveEntireBalance(i, 0);
+            invariant_BalancesAndAllowancesMatchIndependentModel();
+            invariant_TotalSupplyIsFixedAndAllTokensAreAccountedFor();
+        }
+        assertEq(token.balanceOf(handler.actors(0)), SUPPLY);
+        handler.moveEntireBalance(0, 1);
+        invariant_BalancesAndAllowancesMatchIndependentModel();
+        invariant_TotalSupplyIsFixedAndAllTokensAreAccountedFor();
+        assertEq(token.balanceOf(handler.actors(1)), SUPPLY);
     }
 }
